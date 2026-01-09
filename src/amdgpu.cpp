@@ -163,7 +163,22 @@ void AMDGPU::get_instant_metrics(struct amdgpu_common_metrics *metrics) {
 
 			cpu_temp = MAX(cpu_temp, amdgpu_metrics->temperature_core[i]);
 		}
-		metrics->apu_cpu_temp_c = cpu_temp / 100;
+
+		// Fallback: if temperature_core is 0 or invalid, try hwmon or use temperature_soc
+		if (cpu_temp == 0) {
+			int hwmon_temp = 0;
+			if (cpuStats.ReadcpuTempFile(hwmon_temp) && hwmon_temp > 0) {
+				// Use hwmon temperature (already in Celsius)
+				metrics->apu_cpu_temp_c = hwmon_temp;
+			} else if (IS_VALID_METRIC(amdgpu_metrics->temperature_soc) && amdgpu_metrics->temperature_soc > 0) {
+				// Use SoC temperature as approximation
+				metrics->apu_cpu_temp_c = amdgpu_metrics->temperature_soc / 100;
+			} else {
+				metrics->apu_cpu_temp_c = 0;
+			}
+		} else {
+			metrics->apu_cpu_temp_c = cpu_temp / 100;
+		}
 
 		metrics->gpu_load_percent = amdgpu_metrics->average_gfx_activity;
 		// average_apu_power includes gfx_power so remove that from cpu_power
@@ -174,7 +189,7 @@ void AMDGPU::get_instant_metrics(struct amdgpu_common_metrics *metrics) {
 		metrics->average_gfx_power_w = amdgpu_metrics->average_gfx_power / 1000.0;
 		metrics->current_gfxclk_mhz = amdgpu_metrics->average_gfxclk_frequency;
 		metrics->current_uclk_mhz = amdgpu_metrics->average_uclk_frequency;
-		
+
 		if (previous_metrics.common_header.structure_size == 0) {
 			previous_metrics = *amdgpu_metrics;
 			is_temp = false;
@@ -186,7 +201,7 @@ void AMDGPU::get_instant_metrics(struct amdgpu_common_metrics *metrics) {
 				throttling->v3_power.store(false);
 				throttling->v3_thermal.store(false);
 			}
-			return;	
+			return;
 		} else {
 			uint32_t d_thm_core = V3_THROTTLING_DELTA(thm_core);
 			uint32_t d_thm_gfx  = V3_THROTTLING_DELTA(thm_gfx);
