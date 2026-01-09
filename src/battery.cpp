@@ -104,7 +104,7 @@ float BatteryStats::getPower() {
             state[i]=current_status;
         }
 
-        if (state[i] == "Charging" ||  state[i] == "Unknown" || state[i] == "Full") {
+        if (state[i] != "Charging" && state[i] != "Discharging") {
             return 0;
         }
 
