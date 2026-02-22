@@ -881,7 +881,16 @@ void update_fan(){
       auto dirs = ls(path.c_str(), "hwmon", LS_DIRS);
       for (auto& dir : dirs) {
          string full_path = (path + dir + "/name").c_str();
-         if (read_line(full_path).find("steamdeck_hwmon") != string::npos){
+         string name = read_line(full_path);
+         if (name.find("steamdeck_hwmon") != string::npos ||
+             name.find("asus") != string::npos ||
+             name.find("aynec") != string::npos ||
+             name.find("gpdfan") != string::npos ||
+             name.find("msi_ec") != string::npos ||
+             name.find("msi-ec") != string::npos ||
+             name.find("msi_wmi_platform") != string::npos ||
+             name.find("oxp_ec") != string::npos ||
+             name.find("oxpec") != string::npos){
             hwmon_path = path + dir + "/fan1_input";
             break;
          }
