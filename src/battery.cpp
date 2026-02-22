@@ -106,7 +106,7 @@ float BatteryStats::getPower() {
             }
         }
 
-        if (state[i] == "Charging" || state[i] == "Unknown" || state[i] == "Full") {
+        if (state[i] != "Charging" && state[i] != "Discharging") {
             // TODO if we have multiple batteries, we will return 0 if just one of them is charging
             return 0.0f;
         }
