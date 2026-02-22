@@ -209,7 +209,22 @@ void AMDGPU::get_instant_metrics(struct amdgpu_common_metrics *metrics) {
 
 			cpu_temp = MAX(cpu_temp, amdgpu_metrics->temperature_core[i]);
 		}
-		metrics->apu_cpu_temp_c = cpu_temp / 100;
+
+		// Fallback: if temperature_core is 0 or invalid, try hwmon or use temperature_soc
+		if (cpu_temp == 0) {
+			int hwmon_temp = 0;
+			if (cpuStats.ReadcpuTempFile(hwmon_temp) && hwmon_temp > 0) {
+				// Use hwmon temperature (already in Celsius)
+				metrics->apu_cpu_temp_c = hwmon_temp;
+			} else if (IS_VALID_METRIC(amdgpu_metrics->temperature_soc) && amdgpu_metrics->temperature_soc > 0) {
+				// Use SoC temperature as approximation
+				metrics->apu_cpu_temp_c = amdgpu_metrics->temperature_soc / 100;
+			} else {
+				metrics->apu_cpu_temp_c = 0;
+			}
+		} else {
+			metrics->apu_cpu_temp_c = cpu_temp / 100;
+		}
 
 		metrics->gpu_load_percent = amdgpu_metrics->average_gfx_activity;
 		// average_apu_power includes gfx_power so remove that from cpu_power
