@@ -387,7 +387,14 @@ int main(int, char**)
     while (!glfwWindowShouldClose(window)){
         real_params = get_params();
         check_keybinds(*real_params);
-        if (!real_params->no_display && new_frame){
+
+        if (!real_params->no_display) {
+            std::unique_lock<std::mutex> lk(mangoapp_m);
+            mangoapp_cv.wait(lk, [&]{return new_frame || real_params->no_display;});
+            new_frame = false;
+        }
+
+        if (!real_params->no_display){
             if (mangoapp_paused){
                 glfwShowWindow(window);
                 render(window, *real_params);
