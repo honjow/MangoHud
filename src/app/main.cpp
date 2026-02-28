@@ -306,12 +306,13 @@ static bool render(GLFWwindow* window, overlay_params& real_params) {
     int w, h;
     glfwGetWindowSize(window, &w, &h);
     window_size_changed = w != window_size.x || h != window_size.y;
-    if (real_params.enabled[OVERLAY_PARAM_ENABLED_horizontal])
-    // trying to reduce height will break direct scanout in some cases
-    // just leave it for now, we'll revisit it in server
+    // Always use full-screen window size so Gamescope composites the overlay
+    // correctly in all orientations (including non-native landscape devices).
+    // Reducing window size causes Gamescope to misplace the overlay in rotated
+    // coordinate spaces, and also corrupts ImGui's DisplaySize which breaks
+    // position_layer() calculations for non-horizontal layouts.
+    if (screenWidth && screenHeight)
         glfwSetWindowSize(window, screenWidth, screenHeight);
-    else
-        glfwSetWindowSize(window, window_size.x, window_size.y);
 
     ImGui::EndFrame();
 
