@@ -508,6 +508,72 @@ void GPU_fdinfo::find_intel_rapl_gpu()
     );
 }
 
+void GPU_fdinfo::find_intel_pkg_temp()
+{
+    const std::string hwmon_root = "/sys/class/hwmon";
+
+    if (!fs::exists(hwmon_root))
+        return;
+
+    for (const auto& entry : fs::directory_iterator(hwmon_root)) {
+        std::ifstream name_file(entry.path() / "name");
+        if (!name_file.is_open())
+            continue;
+
+        std::string name;
+        std::getline(name_file, name);
+        if (name != "coretemp")
+            continue;
+
+        // Find the tempN_label whose value is "Package id 0".
+        for (const auto& f : fs::directory_iterator(entry.path())) {
+            auto fname = f.path().filename().string();
+            if (fname.find("temp") != 0 || fname.find("_label") == std::string::npos)
+                continue;
+
+            std::ifstream label_file(f.path());
+            if (!label_file.is_open())
+                continue;
+
+            std::string label;
+            std::getline(label_file, label);
+            if (label != "Package id 0")
+                continue;
+
+            auto input = f.path().string();
+            input.replace(input.size() - sizeof("_label") + 1, std::string::npos, "_input");
+
+            pkg_temp_stream.open(input);
+            if (!pkg_temp_stream.good()) {
+                pkg_temp_stream = std::ifstream();
+                continue;
+            }
+
+            SPDLOG_DEBUG(
+                "intel pkg temp: using \"{}\" as iGPU temperature fallback",
+                input
+            );
+            return;
+        }
+    }
+
+    SPDLOG_DEBUG(
+        "intel pkg temp: no coretemp \"Package id 0\" sensor found, "
+        "GPU temperature will be unavailable"
+    );
+}
+
+int GPU_fdinfo::get_pkg_temp()
+{
+    if (!pkg_temp_stream.is_open())
+        return 0;
+
+    pkg_temp_stream.seekg(0);
+    uint64_t v = 0;
+    pkg_temp_stream >> v;
+    return static_cast<int>(v / 1000);
+}
+
 float GPU_fdinfo::get_power_usage_rapl()
 {
     if (!rapl_energy_stream.is_open())
@@ -1021,8 +1087,10 @@ void GPU_fdinfo::main_thread()
 
         if (module == "msm_drm")
             metrics.temp = get_kgsl_temp();
-        else
+        else if (!hwmon_sensors["temp"].filename.empty())
             metrics.temp = hwmon_sensors["temp"].val / 1000.f;
+        else if (pkg_temp_stream.is_open())
+            metrics.temp = get_pkg_temp();
 
         metrics.memory_temp = hwmon_sensors["vram_temp"].val / 1000.f;
 
