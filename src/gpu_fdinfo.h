@@ -91,6 +91,13 @@ private:
     // key is actually present in the current fdinfo snapshot.
     void try_fallback_memory_type();
 
+    // Compute whole-device VRAM (== summed system memory used by every DRM
+    // client of this PCI device). Walks /proc/*/fdinfo so it is more
+    // expensive than get_memory_used() and is throttled in main_thread().
+    float get_system_vram_used();
+    // Cached value of the last successful get_system_vram_used() call.
+    float cached_system_vram_used = 0;
+
     void find_hwmon_sensors();
     std::string find_hwmon_dir();
     std::string find_hwmon_sensor_dir(std::string name);

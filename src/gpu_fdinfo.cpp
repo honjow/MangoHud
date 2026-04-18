@@ -184,6 +184,112 @@ void GPU_fdinfo::try_fallback_memory_type()
     }
 }
 
+// Parse a "<num> KiB|MiB|GiB" string from fdinfo into bytes. Returns 0 on
+// parse failure (e.g. for empty or "0" values without a unit).
+static uint64_t parse_fdinfo_mem_bytes(const std::string& mem)
+{
+    if (mem.empty())
+        return 0;
+
+    uint64_t val = 0;
+    try {
+        val = std::stoull(mem);
+    } catch (...) {
+        return 0;
+    }
+
+    auto space = mem.rfind(" ");
+    if (space == std::string::npos)
+        return val;
+
+    std::string unit = mem.substr(space + 1);
+    if (unit == "KiB")
+        val *= 1024ULL;
+    else if (unit == "MiB")
+        val *= 1024ULL * 1024;
+    else if (unit == "GiB")
+        val *= 1024ULL * 1024 * 1024;
+
+    return val;
+}
+
+float GPU_fdinfo::get_system_vram_used()
+{
+    auto proc = fs::path("/proc");
+    std::error_code ec;
+    if (!fs::exists(proc, ec))
+        return cached_system_vram_used;
+
+    // Same key chosen by try_fallback_memory_type().
+    const std::string& key = drm_memory_type;
+    if (key.empty() || key == "EMPTY")
+        return cached_system_vram_used;
+
+    // drm-client-id is unique per DRM client across the whole device; use it
+    // to deduplicate fds that point to the same client (each ifstream copy
+    // would otherwise be counted again).
+    std::set<std::string> seen_client_ids;
+    uint64_t total_bytes = 0;
+
+    for (const auto& proc_entry : fs::directory_iterator(proc, ec)) {
+        if (ec)
+            break;
+
+        const auto& name = proc_entry.path().filename().string();
+        if (name.empty() || !std::isdigit(static_cast<unsigned char>(name[0])))
+            continue;
+
+        auto fdinfo_dir = proc_entry.path() / "fdinfo";
+        std::error_code dir_ec;
+        if (!fs::exists(fdinfo_dir, dir_ec) || dir_ec)
+            continue;
+
+        std::error_code iter_ec;
+        for (const auto& fd_entry : fs::directory_iterator(fdinfo_dir, iter_ec)) {
+            if (iter_ec)
+                break;
+
+            std::ifstream file(fd_entry.path());
+            if (!file.is_open())
+                continue;
+
+            std::string driver, pdev, client_id, mem;
+
+            for (std::string line; std::getline(file, line);) {
+                if (line.empty() || line[0] == ' ' || line[0] == '\t')
+                    continue;
+
+                size_t colon = line.find(":");
+                if (colon == std::string::npos || colon + 2 >= line.length())
+                    continue;
+
+                auto k = line.substr(0, colon);
+                auto v = line.substr(colon + 2);
+
+                if (k == "drm-driver")
+                    driver = v;
+                else if (k == "drm-pdev")
+                    pdev = v;
+                else if (k == "drm-client-id")
+                    client_id = v;
+                else if (k == key)
+                    mem = v;
+            }
+
+            if (driver != module || pdev != pci_dev || client_id.empty())
+                continue;
+            if (!seen_client_ids.insert(client_id).second)
+                continue;
+
+            total_bytes += parse_fdinfo_mem_bytes(mem);
+        }
+    }
+
+    cached_system_vram_used =
+        static_cast<float>(total_bytes) / (1024.f * 1024.f * 1024.f);
+    return cached_system_vram_used;
+}
+
 float GPU_fdinfo::get_memory_used()
 {
     uint64_t total = 0;
@@ -876,6 +982,7 @@ void GPU_fdinfo::main_thread()
         // (very common on Intel xe/i915, where the buffer-carrying client is
         // created late) get picked up. Also rescan immediately if we currently
         // track no fds at all.
+        bool did_rescan = false;
         {
             auto t = os_time_get_nano() / 1'000'000;
             if (
@@ -884,6 +991,7 @@ void GPU_fdinfo::main_thread()
             ) {
                 find_fd();
                 fdinfo_last_update_ms = t;
+                did_rescan = true;
             }
         }
 
@@ -893,6 +1001,14 @@ void GPU_fdinfo::main_thread()
 
         metrics.load = get_gpu_load();
         metrics.proc_vram_used = get_memory_used();
+        // iGPUs (Intel/Mali/Adreno on this code path) do not have dedicated
+        // VRAM. Approximate "whole-card" usage by summing the resident memory
+        // of every DRM client of this PCI device (walks /proc/*/fdinfo, so we
+        // throttle it to the rescan interval). Cross-uid clients we have no
+        // permission to read are silently skipped.
+        if (did_rescan)
+            get_system_vram_used();
+        metrics.sys_vram_used = cached_system_vram_used;
 
         metrics.powerUsage = get_power_usage();
         if (!hwmon_sensors["power_limit"].filename.empty())
@@ -921,11 +1037,12 @@ void GPU_fdinfo::main_thread()
 
         SPDLOG_DEBUG(
             "pci_dev = {}, pid = {}, module = {}, "
-            "load = {}, proc_vram = {}, power = {}, "
+            "load = {}, proc_vram = {}, sys_vram = {}, power = {}, "
             "core = {}, temp = {}, fan = {}, "
             "voltage = {}",
             pci_dev, pid, module,
-            metrics.load, metrics.proc_vram_used, metrics.powerUsage,
+            metrics.load, metrics.proc_vram_used, metrics.sys_vram_used,
+            metrics.powerUsage,
             metrics.CoreClock, metrics.temp, metrics.fan_speed,
             metrics.voltage
         );
