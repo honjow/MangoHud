@@ -1,5 +1,7 @@
 #include "gpu_fdinfo.h"
 
+#include <algorithm>
+
 #ifndef TEST_ONLY
 #include "hud_elements.h"
 #endif
@@ -143,6 +145,43 @@ uint64_t GPU_fdinfo::get_gpu_time_panfrost() {
     }
 
     return total;
+}
+
+void GPU_fdinfo::try_fallback_memory_type()
+{
+    if (module != "i915" && module != "xe")
+        return;
+
+    // If the current key already shows up in any fd, keep it.
+    for (auto& fd : fdinfo_data) {
+        if (fd.find(drm_memory_type) != fd.end())
+            return;
+    }
+
+    // Otherwise try the iGPU-friendly alternative. Don't switch away from a
+    // working dGPU key when no fds are present yet (fdinfo_data may be empty
+    // during early layer init).
+    const std::string fallback =
+        (module == "i915") ? "drm-resident-system0" : "drm-resident-gtt";
+
+    bool fallback_present = false;
+    for (auto& fd : fdinfo_data) {
+        if (fd.find(fallback) != fd.end()) {
+            fallback_present = true;
+            break;
+        }
+    }
+
+    if (!fallback_present)
+        return;
+
+    if (drm_memory_type != fallback) {
+        SPDLOG_DEBUG(
+            "drm_memory_type \"{}\" not present in any fd, switching to \"{}\" "
+            "(integrated GPU).", drm_memory_type, fallback
+        );
+        drm_memory_type = fallback;
+    }
 }
 
 float GPU_fdinfo::get_memory_used()
@@ -303,10 +342,127 @@ void GPU_fdinfo::get_current_hwmon_readings()
     }
 }
 
+void GPU_fdinfo::find_intel_rapl_gpu()
+{
+    const std::string powercap = "/sys/class/powercap";
+
+    if (!fs::exists(powercap)) {
+        SPDLOG_DEBUG("intel rapl: {} does not exist", powercap);
+        return;
+    }
+
+    for (const auto& entry : fs::directory_iterator(powercap)) {
+        auto base = entry.path().filename().string();
+
+        // Only consider sub-domains like "intel-rapl:0:1", skip the package
+        // "intel-rapl:0" and unrelated dirs.
+        if (base.rfind("intel-rapl:", 0) != 0)
+            continue;
+        if (std::count(base.begin(), base.end(), ':') < 2)
+            continue;
+
+        std::ifstream name_file(entry.path().string() + "/name");
+        if (!name_file.is_open())
+            continue;
+
+        std::string name;
+        std::getline(name_file, name);
+        // The GPU power rail on Intel client SoCs is exposed as "uncore".
+        if (name != "uncore")
+            continue;
+
+        auto energy_path = entry.path().string() + "/energy_uj";
+        rapl_energy_stream.open(energy_path);
+        if (!rapl_energy_stream.good()) {
+            SPDLOG_DEBUG(
+                "intel rapl: failed to open {} (might need read permission)",
+                energy_path
+            );
+            rapl_energy_stream = std::ifstream();
+            continue;
+        }
+
+        std::ifstream max_range(entry.path().string() + "/max_energy_range_uj");
+        if (max_range.is_open())
+            max_range >> rapl_max_energy_range;
+
+        rapl_power_limit_stream.open(
+            entry.path().string() + "/constraint_0_power_limit_uw"
+        );
+
+        SPDLOG_DEBUG(
+            "intel rapl: using \"{}\" as iGPU power source (max_range = {} uJ)",
+            energy_path, rapl_max_energy_range
+        );
+        return;
+    }
+
+    SPDLOG_DEBUG(
+        "intel rapl: no \"uncore\" domain found, GPU power will be unavailable"
+    );
+}
+
+float GPU_fdinfo::get_power_usage_rapl()
+{
+    if (!rapl_energy_stream.is_open())
+        return 0.f;
+
+    rapl_energy_stream.clear();
+    rapl_energy_stream.seekg(0);
+
+    uint64_t energy = 0;
+    rapl_energy_stream >> energy;
+
+    uint64_t now = os_time_get_nano();
+
+    if (rapl_last_time_ns == 0) {
+        rapl_last_energy = energy;
+        rapl_last_time_ns = now;
+        return 0.f;
+    }
+
+    uint64_t delta_energy;
+    if (energy >= rapl_last_energy) {
+        delta_energy = energy - rapl_last_energy;
+    } else if (rapl_max_energy_range > 0) {
+        // Counter wrapped.
+        delta_energy = rapl_max_energy_range - rapl_last_energy + energy;
+    } else {
+        delta_energy = 0;
+    }
+
+    uint64_t delta_ns = now - rapl_last_time_ns;
+    rapl_last_energy = energy;
+    rapl_last_time_ns = now;
+
+    if (delta_ns == 0)
+        return 0.f;
+
+    // delta_energy [uJ] / delta_ns [ns] = 10^-6 J / 10^-9 s = 10^3 W
+    return static_cast<double>(delta_energy) * 1000.0 / delta_ns;
+}
+
+float GPU_fdinfo::get_power_limit_rapl()
+{
+    if (!rapl_power_limit_stream.is_open())
+        return 0.f;
+
+    rapl_power_limit_stream.clear();
+    rapl_power_limit_stream.seekg(0);
+
+    uint64_t limit_uw = 0;
+    rapl_power_limit_stream >> limit_uw;
+
+    return static_cast<float>(limit_uw) / 1'000'000;
+}
+
 float GPU_fdinfo::get_power_usage()
 {
     if (!hwmon_sensors["power"].filename.empty())
         return static_cast<float>(hwmon_sensors["power"].val) / 1'000'000;
+
+    if (rapl_energy_stream.is_open())
+        return get_power_usage_rapl();
 
     float now = hwmon_sensors["energy"].val;
 
@@ -716,23 +872,33 @@ void GPU_fdinfo::main_thread()
         }
 #endif
 
-        // Recheck fds every 10secs, fixes Mass Effect 1, maybe some others too
+        // Periodically rescan fds so that DRM clients opened after layer init
+        // (very common on Intel xe/i915, where the buffer-carrying client is
+        // created late) get picked up. Also rescan immediately if we currently
+        // track no fds at all.
         {
             auto t = os_time_get_nano() / 1'000'000;
-            if (t - fdinfo_last_update_ms >= 10'000) {
+            if (
+                fdinfo.empty() ||
+                t - fdinfo_last_update_ms >= FDINFO_RESCAN_INTERVAL_MS
+            ) {
                 find_fd();
                 fdinfo_last_update_ms = t;
             }
         }
 
         gather_fdinfo_data();
+        try_fallback_memory_type();
         get_current_hwmon_readings();
 
         metrics.load = get_gpu_load();
         metrics.proc_vram_used = get_memory_used();
 
         metrics.powerUsage = get_power_usage();
-        metrics.powerLimit = static_cast<float>(hwmon_sensors["power_limit"].val) / 1'000'000;
+        if (!hwmon_sensors["power_limit"].filename.empty())
+            metrics.powerLimit = static_cast<float>(hwmon_sensors["power_limit"].val) / 1'000'000;
+        else
+            metrics.powerLimit = get_power_limit_rapl();
 
         metrics.CoreClock = get_gpu_clock();
         metrics.voltage = hwmon_sensors["voltage"].val;
