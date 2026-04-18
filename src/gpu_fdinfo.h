@@ -58,6 +58,10 @@ private:
 
     std::vector<std::ifstream> fdinfo;
     uint64_t fdinfo_last_update_ms = 0;
+    // Periodic rescan interval. Kept short so that DRM fds opened by the
+    // application after layer init (very common on Intel xe/i915 where the
+    // buffer-carrying client is created late) are picked up quickly.
+    static constexpr uint64_t FDINFO_RESCAN_INTERVAL_MS = 2000;
 
     std::map<std::string, hwmon_sensor> hwmon_sensors;
 
@@ -82,6 +86,10 @@ private:
     int get_xe_load();
 
     float get_memory_used();
+    // For Intel iGPUs, the memory key is not "drm-resident-vram0" but rather
+    // "drm-resident-gtt" (xe) or "drm-resident-system0" (i915). Pick whichever
+    // key is actually present in the current fdinfo snapshot.
+    void try_fallback_memory_type();
 
     void find_hwmon_sensors();
     std::string find_hwmon_dir();
@@ -90,6 +98,18 @@ private:
 
     float get_power_usage();
     float last_power = 0;
+
+    // Intel iGPUs (MTL/LNL/ARL etc.) do not expose i915-/xe-hwmon at all;
+    // fall back to the powercap "uncore" RAPL domain which on Intel client
+    // SoCs accounts for the GPU power rail.
+    std::ifstream rapl_energy_stream;
+    std::ifstream rapl_power_limit_stream;
+    uint64_t rapl_max_energy_range = 0;
+    uint64_t rapl_last_energy = 0;
+    uint64_t rapl_last_time_ns = 0;
+    void find_intel_rapl_gpu();
+    float get_power_usage_rapl();
+    float get_power_limit_rapl();
 
     std::ifstream gpu_clock_stream;
     void find_i915_gt_dir();
@@ -156,21 +176,11 @@ public:
             drm_memory_type = "drm-resident-memory";
         }
 
-        if (fdinfo_data.size() > 0 &&
-            fdinfo_data[0].find(drm_memory_type) == fdinfo_data[0].end())
-        {
-            auto old_type = drm_memory_type;
-
-            if (module == "i915")
-                drm_memory_type = "drm-resident-system0";
-            else if (module == "xe")
-                drm_memory_type = "drm-resident-gtt";
-
-            SPDLOG_DEBUG(
-                "\"{}\" is not found, you probably have an integrated GPU. "
-                "Using \"{}\"", old_type, drm_memory_type
-            );
-        }
+        // Pick a sane initial guess. The actual key in use is re-evaluated
+        // at runtime in get_memory_used() because at constructor time there
+        // may be no fds yet, or only fds that don't carry buffers.
+        if (module == "i915" || module == "xe")
+            try_fallback_memory_type();
 
         SPDLOG_DEBUG(
             "drm_engine_type = {}, drm_memory_type = {}",
@@ -207,6 +217,13 @@ public:
         }
 
         find_hwmon_sensors();
+
+        // Intel iGPUs have no GPU hwmon at all; try Intel RAPL "uncore" as
+        // a power source so we don't show 0 W forever.
+        if ((module == "i915" || module == "xe") &&
+            hwmon_sensors["power"].filename.empty() &&
+            hwmon_sensors["energy"].filename.empty())
+            find_intel_rapl_gpu();
 
         if (module == "i915")
             find_i915_gt_dir();
