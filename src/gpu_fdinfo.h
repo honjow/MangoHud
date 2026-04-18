@@ -118,6 +118,15 @@ private:
     float get_power_usage_rapl();
     float get_power_limit_rapl();
 
+    // Intel iGPUs share a die with the CPU on every recent client SoC
+    // (Meteor Lake / Lunar Lake / Arrow Lake / Alder Lake P+E), so the
+    // CPU package temperature reported by the coretemp driver is the most
+    // meaningful "GPU temperature" we can get when no GPU-specific hwmon
+    // exists. Used as a fallback only.
+    std::ifstream pkg_temp_stream;
+    void find_intel_pkg_temp();
+    int get_pkg_temp();
+
     std::ifstream gpu_clock_stream;
     void find_i915_gt_dir();
     void find_xe_gt_dir();
@@ -231,6 +240,10 @@ public:
             hwmon_sensors["power"].filename.empty() &&
             hwmon_sensors["energy"].filename.empty())
             find_intel_rapl_gpu();
+
+        if ((module == "i915" || module == "xe") &&
+            hwmon_sensors["temp"].filename.empty())
+            find_intel_pkg_temp();
 
         if (module == "i915")
             find_i915_gt_dir();
