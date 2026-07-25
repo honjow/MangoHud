@@ -1,9 +1,102 @@
 #include <spdlog/spdlog.h>
+#include <cmath>
+#include <fstream>
 #include <filesystem.h>
 #include "battery.h"
 
 namespace fs = ghc::filesystem;
 using namespace std;
+
+bool BatteryStats::current_now_usable(float i_ua)
+{
+    // Consumer packs do not sustain >30A. MSI Claw 8 EX reports a nearly
+    // fixed ~65A value that does not track load, so V*I is meaningless.
+    float abs_i = std::fabs(i_ua);
+    return abs_i > 0.0f && abs_i <= 30e6f;
+}
+
+float BatteryStats::estimate_power_from_capacity(
+    const std::string& syspath, float v_uv
+)
+{
+    const string charge_now_path = syspath + "/charge_now";
+    const string energy_now_path = syspath + "/energy_now";
+
+    float charge_uah = 0.0f;
+    float energy_uwh = 0.0f;
+    bool have_charge = false;
+    bool have_energy = false;
+
+    if (fs::exists(charge_now_path)) {
+        std::ifstream input(charge_now_path);
+        std::string line;
+        if (std::getline(input, line)) {
+            charge_uah = stof(line);
+            have_charge = true;
+        }
+    } else if (fs::exists(energy_now_path)) {
+        std::ifstream input(energy_now_path);
+        std::string line;
+        if (std::getline(input, line)) {
+            energy_uwh = stof(line);
+            have_energy = true;
+        }
+    } else {
+        return last_estimated_power_w;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (!capacity_sample_valid) {
+        last_charge_uah = charge_uah;
+        last_energy_uwh = energy_uwh;
+        last_capacity_sample_time = now;
+        capacity_sample_valid = true;
+        SPDLOG_INFO(
+            "Battery current_now unusable; estimating power from charge/energy delta"
+        );
+        return last_estimated_power_w;
+    }
+
+    double dt = std::chrono::duration<double>(now - last_capacity_sample_time).count();
+    if (dt < 1.0)
+        return last_estimated_power_w;
+
+    float power_w = 0.0f;
+    bool updated = false;
+
+    if (have_charge) {
+        float delta_uah = last_charge_uah - charge_uah;
+        // charge_now is coarse; wait until it actually moves.
+        if (std::fabs(delta_uah) >= 1.0f && std::fabs(v_uv) > 0.0f) {
+            // µAh over seconds → W at current voltage:
+            // (|ΔµAh| / 1e6 / (dt/3600)) * (µV/1e6)
+            power_w = std::fabs(delta_uah) * std::fabs(v_uv) * 3600.0f
+                      / (1e12f * static_cast<float>(dt));
+            updated = true;
+            last_charge_uah = charge_uah;
+            last_capacity_sample_time = now;
+        }
+    } else if (have_energy) {
+        float delta_uwh = last_energy_uwh - energy_uwh;
+        if (std::fabs(delta_uwh) >= 1.0f) {
+            // µWh over seconds → W
+            power_w = std::fabs(delta_uwh) * 3600.0f
+                      / (1e6f * static_cast<float>(dt));
+            updated = true;
+            last_energy_uwh = energy_uwh;
+            last_capacity_sample_time = now;
+        }
+    }
+
+    if (updated) {
+        if (last_estimated_power_w <= 0.0f)
+            last_estimated_power_w = power_w;
+        else
+            last_estimated_power_w = last_estimated_power_w * 0.7f + power_w * 0.3f;
+    }
+
+    return last_estimated_power_w;
+}
 
 void BatteryStats::numBattery() {
     int batteryCount = 0;
@@ -111,36 +204,42 @@ float BatteryStats::getPower() {
             return 0.0f;
         }
 
+        float v_uv = 0.0f;
+        if (fs::exists(voltage_now)) {
+            std::ifstream input(voltage_now);
+            std::string line;
+            if (std::getline(input, line))
+                v_uv = stof(line);
+        }
+
         // Prefer power_now (µW) when available.
         if (fs::exists(power_now)) {
             std::ifstream input(power_now);
             std::string line;
             if (std::getline(input, line)) {
-                power_w += std::fabs(stof(line)) / 1000000.0f;
+                float p = std::fabs(stof(line)) / 1000000.0f;
+                // Same class of firmware bug can poison power_now.
+                if (p <= 200.0f)
+                    power_w += p;
+                else
+                    power_w += estimate_power_from_capacity(syspath, v_uv);
             }
             continue;
         }
 
-        if (fs::exists(current_now) && fs::exists(voltage_now)) {
-            float i_ua = 0.0f;
-            float v_uv = 0.0f;
+        float i_ua = 0.0f;
 
-            {
-                std::ifstream input(current_now);
-                std::string line;
-                if (std::getline(input, line)) {
-                    i_ua = stof(line);
-                }
-            }
-            {
-                std::ifstream input(voltage_now);
-                std::string line;
-                if (std::getline(input, line)) {
-                    v_uv = stof(line);
-                }
-            }
+        if (fs::exists(current_now)) {
+            std::ifstream input(current_now);
+            std::string line;
+            if (std::getline(input, line))
+                i_ua = stof(line);
+        }
 
+        if (current_now_usable(i_ua) && std::fabs(v_uv) > 0.0f) {
             power_w += (std::fabs(i_ua) * std::fabs(v_uv)) * 1e-12f;
+        } else {
+            power_w += estimate_power_from_capacity(syspath, v_uv);
         }
     }
 
@@ -159,35 +258,47 @@ float BatteryStats::getTimeRemaining() {
         string voltage_now = syspath + "/voltage_now";
         string power_now = syspath + "/power_now";
 
+        float v_uv = 0.0f;
+        if (fs::exists(voltage_now)) {
+            std::ifstream input_voltage(voltage_now);
+            std::string line;
+            if (std::getline(input_voltage, line))
+                v_uv = stof(line);
+        }
+
+        bool used_current = false;
         if (fs::exists(current_now)) {
             std::ifstream input(current_now);
             std::string line;
-            if (std::getline(input, line)) {
-                current_now_vec.push_back(std::fabs(stof(line)));
+            float i_ua = 0.0f;
+            if (std::getline(input, line))
+                i_ua = stof(line);
+            if (current_now_usable(i_ua)) {
+                current_now_vec.push_back(std::fabs(i_ua));
+                used_current = true;
             }
-        } else if (fs::exists(power_now) && fs::exists(voltage_now)) {
-            float voltage = 0.0f;
-            float power = 0.0f;
+        }
 
-            {
-                std::ifstream input_voltage(voltage_now);
-                std::string line;
-                if (std::getline(input_voltage, line)) {
-                    voltage = stof(line);
-                }
-            }
-            {
+        if (!used_current) {
+            if (fs::exists(power_now) && std::fabs(v_uv) > 0.0f) {
                 std::ifstream input_power(power_now);
                 std::string line;
-                if (std::getline(input_power, line)) {
-                    power = stof(line);
+                float power = 0.0f;
+                if (std::getline(input_power, line))
+                    power = std::fabs(stof(line));
+                if (power > 0.0f && power / 1e6f <= 200.0f) {
+                    // (µW / µV) = µA
+                    current_now_vec.push_back(power / v_uv);
+                    used_current = true;
                 }
             }
+        }
 
-            if (voltage > 0.0f) {
-                // (µW / µV) = µA
-                current_now_vec.push_back(std::fabs(power) / voltage);
-            }
+        if (!used_current) {
+            // Derive µA from capacity-delta power estimate.
+            float power_w = estimate_power_from_capacity(syspath, v_uv);
+            if (power_w > 0.0f && std::fabs(v_uv) > 0.0f)
+                current_now_vec.push_back(power_w * 1e12f / std::fabs(v_uv));
         }
 
         if (fs::exists(charge_now)) {
@@ -196,9 +307,8 @@ float BatteryStats::getTimeRemaining() {
             if (std::getline(input, line)) {
                 charge += stof(line);
             }
-        } else if (fs::exists(energy_now) && fs::exists(voltage_now)) {
+        } else if (fs::exists(energy_now) && std::fabs(v_uv) > 0.0f) {
             float energy = 0.0f;
-            float voltage = 0.0f;
 
             {
                 std::ifstream input_energy(energy_now);
@@ -207,18 +317,9 @@ float BatteryStats::getTimeRemaining() {
                     energy = stof(line);
                 }
             }
-            {
-                std::ifstream input_voltage(voltage_now);
-                std::string line;
-                if (std::getline(input_voltage, line)) {
-                    voltage = stof(line);
-                }
-            }
 
-            if (voltage > 0.0f) {
-                // (µWh / µV) = µAh
-                charge += energy / voltage;
-            }
+            // (µWh / µV) = µAh
+            charge += energy / v_uv;
         }
 
         if (current_now_vec.size() > 25) {
