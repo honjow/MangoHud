@@ -6,6 +6,7 @@
 #include "hwmon.hpp"
 #include "fdinfo.hpp"
 #include "i915_drm.hpp"
+#include "../intel_fallbacks.hpp"
 
 class Intel_i915 : public GPU, private Hwmon, public FDInfo, private i915_drm {
 private:
@@ -24,6 +25,7 @@ private:
         { "power_limit" , "power1_max"      },
     };
 
+    IntelFallbacks fallbacks;
     uint64_t previous_power_usage = 0;
     std::map<pid_t, uint64_t> previous_gpu_times;
 

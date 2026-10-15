@@ -13,6 +13,7 @@ private:
     };
 
     std::map<pid_t, uint64_t> previous_gpu_times;
+    FDInfoDeviceMemory device_memory;
 
 protected:
     void pre_poll_overrides() override;
@@ -24,6 +25,7 @@ public:
     );
 
     // System-related functions
+    float get_vram_used()   override;
     int get_temperature()   override;
     int get_core_clock()    override;
 

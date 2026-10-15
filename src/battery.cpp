@@ -1,116 +1,125 @@
+#include <algorithm>
+#include <vector>
 #include <spdlog/spdlog.h>
 #include <cmath>
-#include <fstream>
 #include <filesystem.h>
 #include "battery.h"
+#include "file_utils.h"
+#include "string_utils.h"
 
 namespace fs = ghc::filesystem;
 using namespace std;
 
-bool BatteryStats::current_now_usable(float i_ua)
-{
-    // Consumer packs do not sustain >30A. MSI Claw 8 EX reports a nearly
-    // fixed ~65A value that does not track load, so V*I is meaningless.
-    float abs_i = std::fabs(i_ua);
-    return abs_i > 0.0f && abs_i <= 30e6f;
+static bool read_value(const string& path, float& value) {
+    const string line = read_line(path);
+    float parsed = 0.0f;
+    value = 0.0f;
+    if (line.empty() || !try_stof(parsed, line) || !std::isfinite(parsed))
+        return false;
+    value = parsed;
+    return true;
 }
 
-float BatteryStats::estimate_power_from_capacity(
-    const std::string& syspath, float v_uv
-)
+bool BatteryStats::current_now_usable(float i_ua)
 {
-    const string charge_now_path = syspath + "/charge_now";
-    const string energy_now_path = syspath + "/energy_now";
+    // MSI Claw 8 EX can report a stuck ~65A, unrelated to the actual load.
+    return std::isfinite(i_ua) && std::fabs(i_ua) > 0.0f && std::fabs(i_ua) <= 30e6f;
+}
 
-    float charge_uah = 0.0f;
-    float energy_uwh = 0.0f;
-    bool have_charge = false;
-    bool have_energy = false;
+void BatteryStats::refresh_state(int index)
+{
+    const string status = read_line(battPath[index] + "/status");
+    if (sample_paths[index] != battPath[index] || state[index] != status) {
+        capacity_samples[index] = {};
+        current_now_vec.clear();
+        sample_paths[index] = battPath[index];
+    }
+    state[index] = status;
+}
 
-    if (fs::exists(charge_now_path)) {
-        std::ifstream input(charge_now_path);
-        std::string line;
-        if (std::getline(input, line)) {
-            charge_uah = stof(line);
-            have_charge = true;
-        }
-    } else if (fs::exists(energy_now_path)) {
-        std::ifstream input(energy_now_path);
-        std::string line;
-        if (std::getline(input, line)) {
-            energy_uwh = stof(line);
-            have_energy = true;
-        }
-    } else {
-        return last_estimated_power_w;
+float BatteryStats::estimate_power_from_capacity(int index, float v_uv)
+{
+    auto& sample = capacity_samples[index];
+    const string& syspath = battPath[index];
+    float capacity = 0.0f;
+    const bool have_charge = v_uv > 0.0f &&
+        read_value(syspath + "/charge_now", capacity) && capacity >= 0.0f;
+    if (!have_charge &&
+        (!read_value(syspath + "/energy_now", capacity) || capacity < 0.0f)) {
+        sample = {};
+        return 0.0f;
     }
 
-    auto now = std::chrono::steady_clock::now();
-    if (!capacity_sample_valid) {
-        last_charge_uah = charge_uah;
-        last_energy_uwh = energy_uwh;
-        last_capacity_sample_time = now;
-        capacity_sample_valid = true;
-        SPDLOG_INFO(
-            "Battery current_now unusable; estimating power from charge/energy delta"
-        );
-        return last_estimated_power_w;
+    const auto now = sample_clock();
+    if (!sample.valid || sample.uses_charge != have_charge) {
+        sample = {true, have_charge, capacity, 0.0f, now};
+        SPDLOG_INFO("Battery current/power unusable; estimating power from charge/energy delta");
+        return 0.0f;
     }
 
-    double dt = std::chrono::duration<double>(now - last_capacity_sample_time).count();
+    const double dt = std::chrono::duration<double>(now - sample.time).count();
     if (dt < 1.0)
-        return last_estimated_power_w;
+        return sample.power_w;
 
-    float power_w = 0.0f;
-    bool updated = false;
+    const float delta = sample.capacity - capacity;
+    // Coarse capacity readings need a full step, including the preceding idle time.
+    if (std::fabs(delta) < 1.0f)
+        return sample.power_w;
 
-    if (have_charge) {
-        float delta_uah = last_charge_uah - charge_uah;
-        // charge_now is coarse; wait until it actually moves.
-        if (std::fabs(delta_uah) >= 1.0f && std::fabs(v_uv) > 0.0f) {
-            // µAh over seconds → W at current voltage:
-            // (|ΔµAh| / 1e6 / (dt/3600)) * (µV/1e6)
-            power_w = std::fabs(delta_uah) * std::fabs(v_uv) * 3600.0f
-                      / (1e12f * static_cast<float>(dt));
-            updated = true;
-            last_charge_uah = charge_uah;
-            last_capacity_sample_time = now;
-        }
-    } else if (have_energy) {
-        float delta_uwh = last_energy_uwh - energy_uwh;
-        if (std::fabs(delta_uwh) >= 1.0f) {
-            // µWh over seconds → W
-            power_w = std::fabs(delta_uwh) * 3600.0f
-                      / (1e6f * static_cast<float>(dt));
-            updated = true;
-            last_energy_uwh = energy_uwh;
-            last_capacity_sample_time = now;
-        }
+    // Do not turn a capacity reset or a charge/discharge reversal into a spike.
+    const bool wrong_direction = (state[index] == "Discharging" && delta < 0.0f) ||
+                                 (state[index] == "Charging" && delta > 0.0f);
+    const float power_w = std::fabs(delta) * 3600.0f / (1e6f * dt) *
+                          (have_charge ? v_uv / 1e6f : 1.0f);
+    sample.capacity = capacity;
+    sample.time = now;
+    if (wrong_direction || !std::isfinite(power_w) || power_w > 200.0f) {
+        sample.power_w = 0.0f;
+        return 0.0f;
     }
+    sample.power_w = sample.power_w <= 0.0f ? power_w :
+                     sample.power_w * 0.7f + power_w * 0.3f;
+    return sample.power_w;
+}
 
-    if (updated) {
-        if (last_estimated_power_w <= 0.0f)
-            last_estimated_power_w = power_w;
-        else
-            last_estimated_power_w = last_estimated_power_w * 0.7f + power_w * 0.3f;
-    }
-
-    return last_estimated_power_w;
+// A peripheral's battery (a gamepad, a mouse) has the scope "Device"
+static bool is_system_battery(const fs::path& path) {
+    return read_line((path / "type").string()) == "Battery" &&
+           read_line((path / "scope").string()) != "Device";
 }
 
 void BatteryStats::numBattery() {
     int batteryCount = 0;
-    if (!fs::exists("/sys/class/power_supply/")) {
-         batteryCount = 0;
+    std::vector<fs::path> found;
+    for (int i = 0; i < battery_count_max; ++i) {
+        battPath[i].clear();
+        state[i].clear();
+        sample_paths[i].clear();
+        capacity_samples[i] = {};
     }
-    fs::path path("/sys/class/power_supply/");
-    for (auto& p : fs::directory_iterator(path)) {
-        string fileName = p.path().filename();
-        if (fileName.find("BAT") != std::string::npos) {
-            battPath[batteryCount] = p.path();
-            batteryCount += 1;
+    current_now_vec.clear();
+
+    for (const auto& path : { fs::path(power_supply_path), fs::path(deckard_charger_path) }) {
+        if (!fs::exists(path))
+            continue;
+
+        const bool is_deckard = path == fs::path(deckard_charger_path);
+        for (auto& p : fs::directory_iterator(path)) {
+            string fileName = p.path().filename();
+            if (batteryCount < battery_count_max &&
+                (is_deckard ? fileName.find("BAT") != std::string::npos : is_system_battery(p.path()))) {
+                // Skip duplicate battery symlinks.
+                std::error_code ec;
+                fs::path real = fs::canonical(p.path(), ec);
+                if (!ec && std::find(found.begin(), found.end(), real) != found.end())
+                    continue;
+                if (!ec)
+                    found.push_back(real);
+                battPath[batteryCount++] = p.path();
+            }
         }
     }
+
     batt_count = batteryCount;
     batt_check = true;
 }
@@ -118,229 +127,185 @@ void BatteryStats::numBattery() {
 void BatteryStats::update() {
     if (!batt_check) {
         numBattery();
-        if (batt_count == 0) {
+        if (batt_count == 0)
             SPDLOG_ERROR("No battery found");
-        }
     }
 
-     if (batt_count > 0) {
-        current_watt = getPower();
-        current_percent = getPercent();
-        remaining_time = getTimeRemaining();
-    }
+    current_watt = getPower();
+    current_percent = getPercent();
+    remaining_time = getTimeRemaining();
 }
 
 float BatteryStats::getPercent()
 {
-    float charge_n = 0;
-    float charge_f = 0;
-    for(int i = 0; i < batt_count; i++) {
-        string syspath = battPath[i];
-        string charge_now = syspath + "/charge_now";
-        string charge_full = syspath + "/charge_full";
-        string energy_now = syspath + "/energy_now";
-        string energy_full = syspath + "/energy_full";
-        string capacity = syspath + "/capacity";
+    float percent = 0.0f;
+    if (read_value((fs::path(deckard_charger_path) / "battery_percent").string(), percent))
+        return std::clamp(percent, 0.0f, 100.0f);
 
-        if (fs::exists(charge_now)) {
-            std::ifstream input(charge_now);
-            std::string line;
-            if(std::getline(input, line)) {
-                charge_n += (stof(line) / 1000000);
-            }
-            std::ifstream input2(charge_full);
-            if(std::getline(input2, line)) {
-                charge_f += (stof(line) / 1000000);
-            }
+    float capacity_sum = 0.0f, full_sum = 0.0f, percent_sum = 0.0f;
+    int count = 0, first_kind = -1;
+    bool mixed = false;
+    for (int i = 0; i < batt_count; ++i) {
+        const string& syspath = battPath[i];
+        float capacity = 0.0f, full = 0.0f;
+        int kind = 0;
+        if (read_value(syspath + "/charge_now", capacity) &&
+            read_value(syspath + "/charge_full", full) && capacity >= 0.0f && full > 0.0f) {
+            kind = 0;
+        } else if (read_value(syspath + "/energy_now", capacity) &&
+                   read_value(syspath + "/energy_full", full) && capacity >= 0.0f && full > 0.0f) {
+            kind = 1;
+        } else if (read_value(syspath + "/capacity", capacity)) {
+            kind = 2;
+            full = 100.0f;
+        } else {
+            continue;
         }
-
-        else if (fs::exists(energy_now)) {
-            std::ifstream input(energy_now);
-            std::string line;
-            if(std::getline(input, line)) {
-                charge_n += (stof(line) / 1000000);
-            }
-            std::ifstream input2(energy_full);
-            if(std::getline(input2, line)) {
-                charge_f += (stof(line) / 1000000);
-            }
-        }
-
-        else {
-            // using /sys/class/power_supply/BAT*/capacity
-            // No way to get an accurate reading just average the percents if mutiple batteries
-            std::ifstream input(capacity);
-            std::string line;
-            if(std::getline(input, line)) {
-                charge_n += stof(line) / 100;
-                charge_f = batt_count;
-            }
-        }
+        capacity = std::clamp(capacity, 0.0f, full);
+        percent_sum += capacity / full * 100.0f;
+        capacity_sum += capacity;
+        full_sum += full;
+        if (first_kind < 0)
+            first_kind = kind;
+        mixed |= first_kind != kind;
+        ++count;
     }
-    return (charge_n / charge_f) * 100;
+    // Unlike charge/energy units cannot be added. Fall back to mean percentages.
+    return count == 0 ? 0.0f : mixed ? percent_sum / count : capacity_sum / full_sum * 100.0f;
+}
+
+// vph is the measured system rail, bl_power the backlight.
+static bool get_power_deckard(const string& path, float& power) {
+    float vph_w = 0.0f, bl_power_w = 0.0f;
+    if (!read_value((fs::path(path) / "vph").string(), vph_w) ||
+        !read_value((fs::path(path) / "bl_power").string(), bl_power_w))
+        return false;
+    power = vph_w + bl_power_w;
+    return true;
+}
+
+float BatteryStats::battery_power(int index, float v_uv)
+{
+    const string& syspath = battPath[index];
+    float value = 0.0f;
+    if (fs::exists(syspath + "/power_now")) {
+        if (read_value(syspath + "/power_now", value) && std::fabs(value) <= 200e6f) {
+            capacity_samples[index] = {};
+            return std::fabs(value) / 1e6f;
+        }
+    } else if (read_value(syspath + "/current_now", value) && current_now_usable(value) && v_uv > 0.0f) {
+        capacity_samples[index] = {};
+        return std::fabs(value) * v_uv * 1e-12f;
+    }
+    return estimate_power_from_capacity(index, v_uv);
 }
 
 float BatteryStats::getPower() {
     float power_w = 0.0f;
-
-    for (int i = 0; i < batt_count; i++) {
-        string syspath = battPath[i];
-        string current_now = syspath + "/current_now";
-        string voltage_now = syspath + "/voltage_now";
-        string power_now = syspath + "/power_now";
-        string status = syspath + "/status";
-
-        {
-            std::ifstream input(status);
-            std::string line;
-            if (std::getline(input, line)) {
-                current_status = line;
-                state[i] = current_status;
-            }
-        }
-
-        if (state[i] != "Charging" && state[i] != "Discharging") {
-            // TODO if we have multiple batteries, we will return 0 if just one of them is charging
-            return 0.0f;
-        }
-
-        float v_uv = 0.0f;
-        if (fs::exists(voltage_now)) {
-            std::ifstream input(voltage_now);
-            std::string line;
-            if (std::getline(input, line))
-                v_uv = stof(line);
-        }
-
-        // Prefer power_now (µW) when available.
-        if (fs::exists(power_now)) {
-            std::ifstream input(power_now);
-            std::string line;
-            if (std::getline(input, line)) {
-                float p = std::fabs(stof(line)) / 1000000.0f;
-                // Same class of firmware bug can poison power_now.
-                if (p <= 200.0f)
-                    power_w += p;
-                else
-                    power_w += estimate_power_from_capacity(syspath, v_uv);
-            }
+    const bool deckard = fs::exists(fs::path(deckard_power_path) / "vph");
+    current_status.clear();
+    bool deckard_active = batt_count > 0;
+    for (int i = 0; i < batt_count; ++i) {
+        refresh_state(i);
+        // Steam Frame's rail power is system consumption, not charging power.
+        if (deckard) {
+            deckard_active &= !state[i].empty() && state[i] != "Charging" &&
+                              state[i] != "Unknown" && state[i] != "Full";
+            current_status = state[i];
             continue;
         }
+        if (state[i] != "Charging" && state[i] != "Discharging")
+            continue;
+        if (current_status.empty())
+            current_status = state[i];
+        else if (current_status != state[i])
+            current_status = "Unknown";
 
-        float i_ua = 0.0f;
-
-        if (fs::exists(current_now)) {
-            std::ifstream input(current_now);
-            std::string line;
-            if (std::getline(input, line))
-                i_ua = stof(line);
-        }
-
-        if (current_now_usable(i_ua) && std::fabs(v_uv) > 0.0f) {
-            power_w += (std::fabs(i_ua) * std::fabs(v_uv)) * 1e-12f;
-        } else {
-            power_w += estimate_power_from_capacity(syspath, v_uv);
-        }
+        float v_uv = 0.0f;
+        read_value(battPath[i] + "/voltage_now", v_uv);
+        power_w += battery_power(i, v_uv);
     }
-
+    // Keep previous rail power on empty or invalid reads, as upstream does.
+    if (deckard)
+        return !deckard_active ? 0.0f : get_power_deckard(deckard_power_path, power_w) ? power_w : current_watt;
     return power_w;
 }
 
 float BatteryStats::getTimeRemaining() {
-    float current = 0.0f;
-    float charge = 0.0f;
-
-    for (int i = 0; i < batt_count; i++) {
-        string syspath = battPath[i];
-        string current_now = syspath + "/current_now";
-        string charge_now = syspath + "/charge_now";
-        string energy_now = syspath + "/energy_now";
-        string voltage_now = syspath + "/voltage_now";
-        string power_now = syspath + "/power_now";
-
-        float v_uv = 0.0f;
-        if (fs::exists(voltage_now)) {
-            std::ifstream input_voltage(voltage_now);
-            std::string line;
-            if (std::getline(input_voltage, line))
-                v_uv = stof(line);
-        }
-
-        bool used_current = false;
-        if (fs::exists(current_now)) {
-            std::ifstream input(current_now);
-            std::string line;
-            float i_ua = 0.0f;
-            if (std::getline(input, line))
-                i_ua = stof(line);
-            if (current_now_usable(i_ua)) {
-                current_now_vec.push_back(std::fabs(i_ua));
-                used_current = true;
+    float capacity[battery_count_max] = {}, rate[battery_count_max] = {};
+    float voltage[battery_count_max] = {};
+    bool energy_basis[battery_count_max] = {};
+    bool any_energy = false, all_convertible = true;
+    int count = 0;
+    for (int i = 0; i < batt_count; ++i) {
+        refresh_state(i);
+        const bool active = state[i] == "Charging" || state[i] == "Discharging";
+        if (!active && state[i] != "Full" && state[i] != "Not charging")
+            continue;
+        const string& syspath = battPath[i];
+        float charge = 0.0f, energy = 0.0f, current = 0.0f, v_uv = 0.0f;
+        const bool have_charge = read_value(syspath + "/charge_now", charge) && charge >= 0.0f;
+        const bool have_energy = read_value(syspath + "/energy_now", energy) && energy >= 0.0f;
+        read_value(syspath + "/voltage_now", v_uv);
+        if (!active) {
+            // Sequential-discharge systems still have the idle pack's energy available.
+            if (!have_charge && !have_energy)
+                continue;
+            energy_basis[count] = !have_charge;
+            capacity[count] = have_charge ? charge : energy;
+        } else if (have_charge && read_value(syspath + "/current_now", current) && current_now_usable(current)) {
+            capacity[count] = charge;
+            rate[count] = std::fabs(current);
+        } else {
+            const float power_w = battery_power(i, v_uv);
+            if (have_energy && power_w > 0.0f) {
+                capacity[count] = energy;
+                rate[count] = power_w * 1e6f;
+                energy_basis[count] = true;
+            } else if (have_charge && v_uv > 0.0f && power_w > 0.0f) {
+                capacity[count] = charge;
+                // W / µV -> µA. µW / µV alone would produce amps, not µA.
+                rate[count] = power_w * 1e12f / v_uv;
+            } else {
+                current_now_vec.clear();
+                return 0.0f;
             }
         }
-
-        if (!used_current) {
-            if (fs::exists(power_now) && std::fabs(v_uv) > 0.0f) {
-                std::ifstream input_power(power_now);
-                std::string line;
-                float power = 0.0f;
-                if (std::getline(input_power, line))
-                    power = std::fabs(stof(line));
-                if (power > 0.0f && power / 1e6f <= 200.0f) {
-                    // (µW / µV) = µA
-                    current_now_vec.push_back(power / v_uv);
-                    used_current = true;
-                }
-            }
-        }
-
-        if (!used_current) {
-            // Derive µA from capacity-delta power estimate.
-            float power_w = estimate_power_from_capacity(syspath, v_uv);
-            if (power_w > 0.0f && std::fabs(v_uv) > 0.0f)
-                current_now_vec.push_back(power_w * 1e12f / std::fabs(v_uv));
-        }
-
-        if (fs::exists(charge_now)) {
-            std::ifstream input(charge_now);
-            std::string line;
-            if (std::getline(input, line)) {
-                charge += stof(line);
-            }
-        } else if (fs::exists(energy_now) && std::fabs(v_uv) > 0.0f) {
-            float energy = 0.0f;
-
-            {
-                std::ifstream input_energy(energy_now);
-                std::string line;
-                if (std::getline(input_energy, line)) {
-                    energy = stof(line);
-                }
-            }
-
-            // (µWh / µV) = µAh
-            charge += energy / v_uv;
-        }
-
-        if (current_now_vec.size() > 25) {
-            current_now_vec.erase(current_now_vec.begin());
-        }
+        voltage[count] = v_uv;
+        any_energy |= energy_basis[count];
+        all_convertible &= energy_basis[count] || v_uv > 0.0f;
+        ++count;
     }
 
-    if (current_now_vec.empty()) {
+    if (count == 0 || (any_energy && !all_convertible)) {
+        current_now_vec.clear();
         return 0.0f;
     }
-
-    for (const auto& current_now_sample : current_now_vec) {
-        current += current_now_sample;
+    const bool use_energy = all_convertible;
+    float total_capacity = 0.0f, total_rate = 0.0f;
+    for (int i = 0; i < count; ++i) {
+        // µAh * µV / 10^6 = µWh. Normalize both numerator and denominator.
+        const float scale = use_energy && !energy_basis[i] ? voltage[i] / 1e6f : 1.0f;
+        total_capacity += capacity[i] * scale;
+        total_rate += rate[i] * scale;
     }
-    current /= static_cast<float>(current_now_vec.size());
-
-    if (current <= 0.0f) {
+    if (remaining_uses_energy != use_energy) {
+        current_now_vec.clear();
+        remaining_uses_energy = use_energy;
+    }
+    if (total_rate <= 0.0f) {
+        current_now_vec.clear();
         return 0.0f;
     }
-
-    return charge / current;
+    // One total sample per update, not one sample per battery.
+    current_now_vec.push_back(total_rate);
+    if (current_now_vec.size() > 25)
+        current_now_vec.erase(current_now_vec.begin());
+    float average_rate = 0.0f;
+    for (const float sample : current_now_vec)
+        average_rate += sample;
+    average_rate /= current_now_vec.size();
+    return total_capacity / average_rate;
 }
 
 BatteryStats Battery_Stats;

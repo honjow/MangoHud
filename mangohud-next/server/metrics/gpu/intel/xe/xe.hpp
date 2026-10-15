@@ -6,6 +6,7 @@
 #include "hwmon.hpp"
 #include "fdinfo.hpp"
 #include "xe_drm.hpp"
+#include "../intel_fallbacks.hpp"
 
 class Intel_xe : public GPU, private Hwmon, public FDInfo, private xe_drm {
 private:
@@ -26,6 +27,7 @@ private:
         { "power_limit" , "power2_max"      }
     };
 
+    IntelFallbacks fallbacks;
     uint64_t previous_power_usage = 0;
     std::map<std::string, std::pair<uint64_t, uint64_t>> previous_cycles;
 

@@ -5,8 +5,11 @@
 Intel_xe::Intel_xe(
     const std::string& drm_node, const std::string& pci_dev,
     uint16_t vendor_id, uint16_t device_id
-) : GPU(drm_node, pci_dev, vendor_id, device_id, "gpu-intel-xe"), FDInfo(drm_node) {
+) : GPU(drm_node, pci_dev, vendor_id, device_id, "gpu-intel-xe"), FDInfo(drm_node),
+    fallbacks("xe", pci_dev) {
     hwmon.setup(sensors, drm_node);
+    fallbacks.setup(!hwmon.is_open("energy"), !hwmon.is_open("power_limit"),
+                    !hwmon.is_open("temp"));
     drm_available = drm.setup("/dev/dri/by-path/pci-" + pci_dev + "-card");
     find_gt_dir();
 }
@@ -14,13 +17,14 @@ Intel_xe::Intel_xe(
 void Intel_xe::pre_poll_overrides() {
     hwmon.poll_sensors();
     fdinfo.poll_all();
-    drm.poll();
+    if (drm_available)
+        drm.poll();
     throttling = get_throttling_status();
 }
 
 float Intel_xe::get_vram_used() {
-    if (!drm_available)
-        return 0.f;
+    if (!drm_available || !drm.get_total_memory())
+        return fallbacks.get_device_memory_used();
 
     return drm.get_used_memory() / 1024.f / 1024.f / 1024.f;
 }
@@ -37,6 +41,8 @@ int Intel_xe::get_memory_temp() {
 }
 
 int Intel_xe::get_temperature() {
+    if (!hwmon.is_open("temp"))
+        return fallbacks.get_temperature();
     return std::round(hwmon.get_sensor_value("temp") / 1000.f);
 }
 
@@ -61,6 +67,8 @@ int Intel_xe::get_voltage() {
 }
 
 float Intel_xe::get_power_usage() {
+    if (!hwmon.is_open("energy"))
+        return fallbacks.get_power_usage();
     uint64_t current_power_usage = hwmon.get_sensor_value("energy");
 
     if (!previous_power_usage) {
@@ -78,6 +86,8 @@ float Intel_xe::get_power_usage() {
 }
 
 float Intel_xe::get_power_limit() {
+    if (!hwmon.is_open("power_limit"))
+        return fallbacks.get_power_limit();
     float limit = hwmon.get_sensor_value("power_limit") / 1'000'000.f;
     return limit;
 }
@@ -103,6 +113,7 @@ int Intel_xe::get_fan_speed() {
 }
 
 int Intel_xe::get_process_load(pid_t pid) {
+    std::unique_lock lock(fdinfo.pids_mutex);
     if (fdinfo.pids.find(pid) == fdinfo.pids.end())
         return 0.f;
 
@@ -151,7 +162,7 @@ int Intel_xe::get_process_load(pid_t pid) {
 }
 
 float Intel_xe::get_process_vram_used(pid_t pid) {
-    return fdinfo.get_memory_used(pid, "drm-resident-vram0");
+    return fdinfo.get_memory_used(pid, {"drm-resident-vram0", "drm-resident-gtt"});
 }
 
 float Intel_xe::get_process_gtt_used(pid_t pid) {

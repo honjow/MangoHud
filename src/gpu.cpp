@@ -1,3 +1,4 @@
+#include <set>
 #include "gpu.h"
 #include "file_utils.h"
 #include "hud_elements.h"
@@ -112,6 +113,13 @@ GPUS::GPUS(const overlay_params* early_params) {
         break;
     }
 
+}
+
+bool GPU::is_steam_frame() {
+    if (driver != "msm_dpu" && driver != "msm_drm")
+        return false;
+
+    return drm_node_is_steam_frame(drm_node);
 }
 
 std::string GPUS::get_driver(const std::string& node) {

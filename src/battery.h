@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+static constexpr int battery_count_max = 2;
+
 class BatteryStats{
     public:
         void numBattery();
@@ -10,27 +12,42 @@ class BatteryStats{
         float getPower();
         float getPercent();
         float getTimeRemaining();
-        std::string battPath[2];
+        std::string battPath[battery_count_max];
         float current_watt = 0;
         float current_percent = 0;
         float remaining_time = 0;
         std::string current_status;
-        std::string state [2];
+        std::string state[battery_count_max];
         int batt_count=0;
         bool batt_check = false;
+        // Aggregate rate history: microamps, or microwatts for energy-based packs.
         std::vector<float> current_now_vec = {};
 
     private:
-        // MSI Claw (and similar) firmware can report a stuck/bogus current_now
-        // (~65A). Fall back to charge/energy delta estimation in that case.
-        bool capacity_sample_valid = false;
-        float last_charge_uah = 0.0f;
-        float last_energy_uwh = 0.0f;
-        float last_estimated_power_w = 0.0f;
-        std::chrono::steady_clock::time_point last_capacity_sample_time{};
+        using Clock = std::chrono::steady_clock;
+        struct CapacitySample {
+            bool valid = false;
+            bool uses_charge = false;
+            float capacity = 0.0f;
+            float power_w = 0.0f;
+            Clock::time_point time{};
+        };
+        // A sample belongs to one battery and one charge/discharge session.
+        CapacitySample capacity_samples[battery_count_max];
+        std::string sample_paths[battery_count_max];
+        bool remaining_uses_energy = false;
+
+        // Private injection points for deterministic sysfs fixtures; no user setting.
+        friend struct BatteryTestAccess;
+        std::string power_supply_path = "/sys/class/power_supply/";
+        std::string deckard_charger_path = "/run/deckardcharger/";
+        std::string deckard_power_path = "/run/power-monitor/power/";
+        Clock::time_point (*sample_clock)() = Clock::now;
 
         static bool current_now_usable(float i_ua);
-        float estimate_power_from_capacity(const std::string& syspath, float v_uv);
+        void refresh_state(int index);
+        float battery_power(int index, float v_uv);
+        float estimate_power_from_capacity(int index, float v_uv);
 };
 
 extern BatteryStats Battery_Stats;

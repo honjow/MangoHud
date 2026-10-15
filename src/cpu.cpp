@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include "platform_sensors.h"
 #include <memory>
 #include <string>
 #include <iostream>
@@ -111,6 +112,13 @@ CPUStats::~CPUStats()
     if (m_cpuTempFile) {
         fclose(m_cpuTempFile);
         m_cpuTempFile = nullptr;
+    }
+    for (auto file : m_cpuTempFiles)
+        fclose(file);
+    m_cpuTempFiles.clear();
+    if (m_platformFanFile) {
+        fclose(m_platformFanFile);
+        m_platformFanFile = nullptr;
     }
 }
 
@@ -281,8 +289,31 @@ bool CPUStats::UpdateCoreMhz() {
 }
 
 bool CPUStats::ReadcpuTempFile(int& temp) {
-	if (!m_cpuTempFile)
+	if (!m_cpuTempFile && m_cpuTempFiles.empty())
 		return false;
+
+    if (!m_cpuTempFiles.empty()) {
+        int total_temp = 0;
+        int count = 0;
+
+        for (auto file : m_cpuTempFiles) {
+            rewind(file);
+            fflush(file);
+
+            int current_temp = 0;
+            if (fscanf(file, "%d", &current_temp) != 1)
+                continue;
+
+            total_temp += current_temp / 1000;
+            count++;
+        }
+
+        if (!count)
+            return false;
+
+        temp = total_temp / count;
+        return true;
+    }
 
 	rewind(m_cpuTempFile);
 	fflush(m_cpuTempFile);
@@ -295,7 +326,7 @@ bool CPUStats::ReadcpuTempFile(int& temp) {
 bool CPUStats::UpdateCpuTemp() {
     if (gpus) {
         for (auto gpu : gpus->available_gpus) {
-            if (gpu->is_apu()) {
+            if (gpu->is_apu() && gpu->metrics.apu_cpu_temp > 0) {
                 m_cpuDataTotal.temp = gpu->metrics.apu_cpu_temp;
                 return true;
             }
@@ -306,6 +337,21 @@ bool CPUStats::UpdateCpuTemp() {
     bool ret = ReadcpuTempFile(temp);
     m_cpuDataTotal.temp = temp;
 
+    return ret;
+}
+
+bool CPUStats::UpdatePlatformFanSpeed() {
+    if (!GetPlatformFanFile()) {
+        m_platformFanSpeed = -1;
+        return false;
+    }
+
+    rewind(m_platformFanFile);
+    fflush(m_platformFanFile);
+
+    int fan_speed = 0;
+    bool ret = fscanf(m_platformFanFile, "%d", &fan_speed) == 1;
+    m_platformFanSpeed = ret ? fan_speed / m_platformFanDivisor : -1;
     return ret;
 }
 
@@ -462,6 +508,14 @@ static bool get_cpu_power_xgene(CPUPowerData* cpuPowerData, float& power) {
     return true;
 }
 
+static bool get_cpu_power_deckard(float& power) {
+    std::string value = read_line("/run/power-monitor/power/cores_total");
+    if (value.empty())
+        return false;
+
+    return try_stof(power, value);
+}
+
 bool CPUStats::UpdateCpuPower() {
     InitCpuPowerData();
 
@@ -488,6 +542,9 @@ bool CPUStats::UpdateCpuPower() {
             break;
         case CPU_POWER_XGENE:
             if (!get_cpu_power_xgene(m_cpuPowerData.get(), power)) return false;
+            break;
+        case CPU_POWER_DECKARD:
+            if (!get_cpu_power_deckard(power)) return false;
             break;
         default:
             return false;
@@ -558,8 +615,32 @@ static void check_thermal_zones(std::string& path, std::string& input) {
     }
 }
 
+static void find_cpu_thermal_zones(std::vector<std::string>& inputs) {
+    std::string sysfs_thermal = "/sys/class/thermal/";
+
+    if (!fs::exists(sysfs_thermal))
+        return;
+
+    std::regex cpu_thermal("cpu\\d+(-top)?-thermal");
+
+    for (auto& d : fs::directory_iterator(sysfs_thermal)) {
+        if (d.path().filename().string().substr(0, 12) != "thermal_zone")
+            continue;
+
+        std::string type = read_line(d / "type");
+        if (!std::regex_match(type, cpu_thermal))
+            continue;
+
+        std::string input = d / "temp";
+        if (file_exists(input))
+            inputs.push_back(input);
+    }
+
+    std::sort(inputs.begin(), inputs.end());
+}
+
 bool CPUStats::GetCpuFile() {
-    if (m_cpuTempFile)
+    if (m_cpuTempFile || !m_cpuTempFiles.empty())
         return true;
 
     std::string name, path, input;
@@ -629,6 +710,20 @@ bool CPUStats::GetCpuFile() {
     }
 
     if (input.empty() || !file_exists(input)) {
+        std::vector<std::string> inputs;
+        find_cpu_thermal_zones(inputs);
+        for (auto& temp_input : inputs) {
+            FILE* file = fopen(temp_input.c_str(), "r");
+            if (!file)
+                continue;
+
+            SPDLOG_INFO("thermal: using cpu temp input: {}", temp_input);
+            m_cpuTempFiles.push_back(file);
+        }
+
+        if (!m_cpuTempFiles.empty())
+            return true;
+
         SPDLOG_ERROR("Could not find cpu temp sensor location");
         return false;
     }
@@ -637,6 +732,33 @@ bool CPUStats::GetCpuFile() {
     m_cpuTempFile = fopen(input.c_str(), "r");
 
     return true;
+}
+
+bool CPUStats::GetPlatformFanFile() {
+    if (m_platformFanFile)
+        return true;
+
+    std::string hwmon = "/sys/class/hwmon/";
+    auto dirs = ls(hwmon.c_str());
+    for (auto& dir : dirs) {
+        std::string path = hwmon + dir;
+        std::string name = read_line(path + "/name");
+        std::string input = path + "/fan1_input";
+
+        if (!file_exists(input))
+            continue;
+
+        const int divisor = platform_fan_divisor(name);
+        if (divisor == 0)
+            continue;
+        m_platformFanDivisor = divisor;
+
+        SPDLOG_INFO("hwmon: using platform fan input: {}", input);
+        m_platformFanFile = fopen(input.c_str(), "r");
+        return m_platformFanFile != nullptr;
+    }
+
+    return false;
 }
 
 static CPUPowerData_k10temp* init_cpu_power_data_k10temp(const std::string path) {
@@ -777,6 +899,14 @@ bool CPUStats::InitCpuPowerData() {
     }
 
     if (!cpuPowerData) {
+        float power = 0.0f;
+        if (get_cpu_power_deckard(power)) {
+            auto powerData = std::make_unique<CPUPowerData_deckard>();
+            cpuPowerData = (CPUPowerData*)powerData.release();
+        }
+    }
+
+    if (!cpuPowerData) {
         std::string powercap = "/sys/class/powercap/";
         auto powercap_dirs = ls(powercap.c_str());
         for (auto& dir : powercap_dirs) {
@@ -848,24 +978,43 @@ void CPUStats::get_cpu_cores_types_intel() {
         std::string cpus;
         std::getline(core_file, cpus);
 
-        std::regex rx("(\\d+)-(\\d+)");
-        std::smatch matches;
-
-        if (!std::regex_match(cpus, matches, rx) || matches.size() != 3)
+        if (cpus.empty())
             continue;
 
-        int start = 0, end = 0;
+        std::vector<std::string> chunks;
 
-        try {
-            start = std::stoi(matches[1]);
-            end = std::stoi(matches[2]) + 1;
-        } catch (...) {
-            SPDLOG_ERROR("error parsing cpus \"{}\"", cpus);
+        // split string by comma
+        size_t pos;
+        while((pos = cpus.find(',')) != std::string::npos) {
+            chunks.push_back(cpus.substr(0, pos));
+            cpus = cpus.substr(pos + 1);
         }
 
-        for (int i = start; i < end; i++) {
+        chunks.push_back(cpus);
+
+        std::vector<int> cores;
+
+        // if chunk doesn't contain dash, then it's just a core number,
+        // else it's a range, so we parse start and end of the range
+        // and insert all core numbers to vector.
+        for (const std::string& ch : chunks) {
+            size_t dash_pos = ch.find('-');
+
+            if (dash_pos == std::string::npos) {
+                cores.push_back(std::stoi(ch));
+            } else {
+                int start = std::stoi(ch.substr(0, dash_pos));
+                int end = std::stoi(ch.substr(dash_pos + 1));
+
+                for (int i = start; i < end + 1; i++)
+                    cores.push_back(i);
+            }
+        }
+
+        for (const int core : cores) {
+            // this for loop is here just in case m_cpuData is not sorted.
             for (size_t k = 0; k < m_cpuData.size(); k++) {
-                if (m_cpuData[k].cpu_id != i)
+                if (m_cpuData[k].cpu_id != core)
                     continue;
 
                 m_cpuData[k].label = key;

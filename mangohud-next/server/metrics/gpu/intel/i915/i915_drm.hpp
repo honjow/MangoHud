@@ -5,14 +5,16 @@
 
 class i915_drm_base {
 private:
-    bool has_cap_perfmon = false;
-    int card_fd = 0;
+    int card_fd = -1;
     uint64_t total_memory = 0;
     uint64_t free_memory = 0;
     uint64_t used_memory = 0;
 
 public:
     i915_drm_base();
+    ~i915_drm_base();
+    i915_drm_base(const i915_drm_base&) = delete;
+    i915_drm_base& operator=(const i915_drm_base&) = delete;
     bool setup(const std::string& card);
     void poll();
     uint64_t get_total_memory() const;

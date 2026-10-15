@@ -9,6 +9,8 @@ project('MangoHud',
 cc = meson.get_compiler('c')
 cpp = meson.get_compiler('cpp')
 
+add_global_arguments('-DFMT_CONSTEVAL=', language: 'cpp')
+
 prog_python = import('python').find_installation('python3', modules: ['mako'])
 null_dep = dependency('', required : false)
 vcs_tag_command = ['git', 'describe', '--tags', '--dirty=+']
@@ -308,12 +310,34 @@ endif
 
 if get_option('mangoapp')
   glfw3_dep = dependency('glfw3')
+  xi_dep = dependency('xi')
 endif
 
+libdrm_dep = dependency('libdrm')
+tracefs_dep = dependency('libtracefs', required: false)
+gpu_tracefs_deps = []
+gpu_tracefs_args = []
+tracefs_links = false
+if tracefs_dep.found()
+  tracefs_links = cc.links('''
+    #include <tracefs.h>
+    int main(void) { return tracefs_tracing_dir() == 0; }
+  ''', dependencies: tracefs_dep, name: 'usable libtracefs')
+endif
+if tracefs_links
+  gpu_tracefs_deps += tracefs_dep
+  gpu_tracefs_args += '-DHAVE_TRACEFS_GPU_MEM'
+endif
+
+subdir('mangohud-next/legacy_gpu_wrapper')
 subdir('src')
 
 if get_option('include_doc')
   subdir('data')
+endif
+
+if host_machine.system() == 'linux' and not get_option('tests').disabled()
+  subdir('tests')
 endif
 
 if get_option('tests').enabled()

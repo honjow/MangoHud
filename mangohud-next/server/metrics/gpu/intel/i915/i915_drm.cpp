@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <vector>
 #include <stdint.h>
 #include <libdrm/i915_drm.h>
 #include <errno.h>
@@ -6,7 +7,6 @@
 #include <assert.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
-#include <sys/capability.h>
 #include <unistd.h>
 
 #include <spdlog/spdlog.h>
@@ -71,23 +71,17 @@ static std::vector<void*> intel_i915_query_alloc(int fd, uint64_t query_id, int3
     return data;
 }
 
-static bool is_capability_available(int capability) {
-    cap_t cap = cap_get_proc();
-    cap_flag_value_t cap_enabled = {};
+i915_drm_base::i915_drm_base() {}
 
-    cap_get_flag(cap, capability, CAP_EFFECTIVE, &cap_enabled);
-    cap_free(cap);
-
-    return static_cast<bool>(cap_enabled);
-}
-
-i915_drm_base::i915_drm_base() {
-    has_cap_perfmon = is_capability_available(CAP_PERFMON);
-    SPDLOG_DEBUG("has_cap_perfmon = {}", has_cap_perfmon);
+i915_drm_base::~i915_drm_base() {
+    if (card_fd >= 0)
+        close(card_fd);
 }
 
 bool i915_drm_base::setup(const std::string& card) {
-    card_fd = open(card.c_str(), O_WRONLY);
+    if (card_fd >= 0)
+        close(card_fd);
+    card_fd = open(card.c_str(), O_WRONLY | O_CLOEXEC);
 
     if (card_fd < 0) {
         SPDLOG_ERROR("Failed to open {}.", card);
@@ -98,6 +92,8 @@ bool i915_drm_base::setup(const std::string& card) {
 }
 
 void i915_drm_base::poll() {
+    if (card_fd < 0)
+        return;
     int32_t length = 0;
 
     std::vector<void*> ptr =
@@ -136,9 +132,6 @@ uint64_t i915_drm_base::get_total_memory() const {
 }
 
 uint64_t i915_drm_base::get_used_memory() const {
-    if (!has_cap_perfmon && geteuid() != 0)
-        return 0;
-
     return used_memory;
 }
 

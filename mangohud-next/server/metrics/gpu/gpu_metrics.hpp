@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <unordered_map>
 
 struct gpu_metrics_process_t {
     int     load;

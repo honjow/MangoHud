@@ -78,7 +78,7 @@ Install necessary development packages.
 - GBM (libgbm-dev)
 - libdrm (libdrm-dev)
 - libcap (libcap-dev)
-- libsystemd (libsystemd-dev)
+- sd-bus (libsystemd-dev, or elogind on non-systemd distributions)
 - yaml-cpp (libyaml-cpp-dev)
 - X11 (libx11-dev)
 - XNVCtrl (libxnvctrl-dev), optional, use `-Dwith_xnvctrl=disabled` option with `meson` to disable
@@ -319,7 +319,9 @@ If you start the game from the terminal with MangoHud enabled (for example by st
 
 You can find an example config in /usr/share/doc/mangohud
 
-[GOverlay](https://github.com/benjamimgois/goverlay) is a GUI application that can be used to manage the config
+[GOverlay](https://github.com/benjamimgois/goverlay) Qt GUI for configuring MangoHud.
+
+[MangoJuice](https://github.com/radiolamp/mangojuice) GTK GUI for configuring MangoHud.
 
 ---
 
@@ -402,7 +404,7 @@ Parameters that are enabled by default have to be explicitly disabled. These (cu
 | `frame_count`                      | Display frame count                                                                   |
 | `frametime`                        | Display frametime next to FPS text                                                    |
 | `frame_timing_detailed`            | Display frame timing in a more detailed chart                                         |
-| `fsr`                              | Display the status of FSR (only works in gamescope)                                   |
+| `fsr`                              | Display the status of gamescope's upscaler (FSR, NIS, SGSR, etc.)                     |
 | `hdr`                              | Display the status of HDR (only works in gamescope)                                   |
 | `refresh_rate`                     | Display the current refresh rate (only works in gamescope)                            |
 | `full`                             | Enable most of the toggleable parameters (currently excludes `histogram`)             |
@@ -644,8 +646,8 @@ Example output:
 		<td>Total VRAM</td>
 		<td>🟢</td>
 		<td>🟢</td>
-		<td>🔴</td>
-		<td>🔴</td>
+		<td>🟢</td>
+		<td>🟢</td>
 		<td>🔴</td>
 		<td>🔴</td>
 		<td>🔴</td>

@@ -1,49 +1,14 @@
 #pragma once
 
-#include <inttypes.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-#include <cstdint>
-#include <thread>
-#include <atomic>
-#include <map>
-#include <set>
-#include <regex>
-#include <sstream>
-
-#ifdef TEST_ONLY
-#include <../src/mesa/util/os_time.h>
-#else
-#include "mesa/util/os_time.h"
-#endif
-
 #include <spdlog/spdlog.h>
-#include <filesystem.h>
-
 #include "gpu_metrics_util.h"
-
-struct hwmon_sensor {
-    std::regex rx;
-    std::ifstream stream;
-    std::string filename;
-    unsigned char id = 0;
-    uint64_t val = 0;
-};
-
-enum GPU_throttle_status : int {
-    POWER = 0b0001,
-    CURRENT = 0b0010,
-    TEMP = 0b0100,
-    OTHER = 0b1000,
-};
+#include "../mangohud-next/legacy_gpu_wrapper/wrapper.hpp"
 
 class GPU_fdinfo {
 private:
     pid_t pid = getpid();
 
-    const std::string module;
+    const std::string driver;
     const std::string pci_dev;
     const std::string drm_node;
 
@@ -56,204 +21,15 @@ private:
     struct gpu_metrics metrics;
     mutable std::mutex metrics_mutex;
 
-    std::vector<std::ifstream> fdinfo;
-    uint64_t fdinfo_last_update_ms = 0;
-    // Periodic rescan interval. Kept short so that DRM fds opened by the
-    // application after layer init (very common on Intel xe/i915 where the
-    // buffer-carrying client is created late) are picked up quickly.
-    static constexpr uint64_t FDINFO_RESCAN_INTERVAL_MS = 2000;
-
-    std::map<std::string, hwmon_sensor> hwmon_sensors;
-
-    std::string drm_engine_type = "EMPTY";
-    std::string drm_memory_type = "EMPTY";
-
-    std::vector<std::map<std::string, std::string>> fdinfo_data;
-    void gather_fdinfo_data();
+    LegacyGPUWrapper gpu;
 
     void main_thread();
 
-    void find_fd();
-    void open_fdinfo_fd(std::string path);
-
-    int get_gpu_load();
-    uint64_t get_gpu_time();
-
-    uint64_t previous_gpu_time = 0, previous_time = 0;
-
-    std::vector<uint64_t> xe_fdinfo_last_cycles;
-    std::map<std::string, std::pair<uint64_t, uint64_t>> prev_xe_cycles;
-    int get_xe_load();
-
-    float get_memory_used();
-    // For Intel iGPUs, the memory key is not "drm-resident-vram0" but rather
-    // "drm-resident-gtt" (xe) or "drm-resident-system0" (i915). Pick whichever
-    // key is actually present in the current fdinfo snapshot.
-    void try_fallback_memory_type();
-
-    // Compute whole-device VRAM (== summed system memory used by every DRM
-    // client of this PCI device). Walks /proc/*/fdinfo so it is more
-    // expensive than get_memory_used() and is throttled in main_thread().
-    float get_system_vram_used();
-    // Cached value of the last successful get_system_vram_used() call.
-    float cached_system_vram_used = 0;
-
-    void find_hwmon_sensors();
-    std::string find_hwmon_dir();
-    std::string find_hwmon_sensor_dir(std::string name);
-    void get_current_hwmon_readings();
-
-    float get_power_usage();
-    float last_power = 0;
-
-    // Intel iGPUs (MTL/LNL/ARL etc.) do not expose i915-/xe-hwmon at all;
-    // fall back to the powercap "uncore" RAPL domain which on Intel client
-    // SoCs accounts for the GPU power rail.
-    std::ifstream rapl_energy_stream;
-    std::ifstream rapl_power_limit_stream;
-    uint64_t rapl_max_energy_range = 0;
-    uint64_t rapl_last_energy = 0;
-    uint64_t rapl_last_time_ns = 0;
-    void find_intel_rapl_gpu();
-    float get_power_usage_rapl();
-    float get_power_limit_rapl();
-
-    // Intel iGPUs share a die with the CPU on every recent client SoC
-    // (Meteor Lake / Lunar Lake / Arrow Lake / Alder Lake P+E), so the
-    // CPU package temperature reported by the coretemp driver is the most
-    // meaningful "GPU temperature" we can get when no GPU-specific hwmon
-    // exists. Used as a fallback only.
-    std::ifstream pkg_temp_stream;
-    void find_intel_pkg_temp();
-    int get_pkg_temp();
-
-    std::ifstream gpu_clock_stream;
-    void find_i915_gt_dir();
-    void find_xe_gt_dir();
-    int get_gpu_clock();
-
-    uint64_t get_gpu_time_panfrost();
-    int get_gpu_clock_mali();
-
-    std::ifstream throttle_status_stream;
-    std::vector<std::ifstream> throttle_power_streams;
-    std::vector<std::ifstream> throttle_current_streams;
-    std::vector<std::ifstream> throttle_temp_streams;
-    bool check_throttle_reasons(std::vector<std::ifstream> &throttle_reason_streams);
-    int get_throttling_status();
-
-    const std::vector<std::string> intel_throttle_power = {"reason_pl1", "reason_pl2"};
-    const std::vector<std::string> intel_throttle_current = {"reason_pl4", "reason_vr_tdc"};
-    const std::vector<std::string> intel_throttle_temp = {
-        "reason_prochot", "reason_ratl", "reason_thermal", "reason_vr_thermalert"};
-    void load_xe_i915_throttle_reasons(
-        std::string throttle_folder,
-        std::vector<std::string> throttle_reasons,
-        std::vector<std::ifstream> &throttle_reason_streams);
-
-    std::map<std::string, std::ifstream> kgsl_streams;
-    void init_kgsl();
-    int get_kgsl_load();
-    int get_kgsl_temp();
-
 public:
     GPU_fdinfo(
-        const std::string module, const std::string pci_dev, const std::string drm_node,
-        const bool called_from_amdgpu_cpp=false
-    )
-        : module(module)
-        , pci_dev(pci_dev)
-        , drm_node(drm_node)
-    {
-        SPDLOG_DEBUG("GPU driver is \"{}\"", module);
-
-        find_fd();
-        gather_fdinfo_data();
-
-        if (module == "i915") {
-            drm_engine_type = "drm-engine-render";
-            drm_memory_type = "drm-resident-local0";
-        } else if (module == "xe") {
-            drm_engine_type = "drm-total-cycles-rcs";
-            drm_memory_type = "drm-resident-vram0";
-        } else if (module == "amdgpu") {
-            drm_engine_type = "drm-engine-gfx";
-            drm_memory_type = "drm-memory-vram";
-        } else if (module == "msm_dpu") {
-            // msm driver does not report vram usage
-            drm_engine_type = "drm-engine-gpu";
-        } else if (module == "msm_drm") {
-            init_kgsl();
-        } else if (module == "panfrost") {
-            drm_engine_type = "drm-engine-fragment";
-            drm_memory_type = "drm-resident-memory";
-        } else if (module == "panthor") {
-            drm_engine_type = "drm-engine-panthor";
-            drm_memory_type = "drm-resident-memory";
-        }
-
-        // Pick a sane initial guess. The actual key in use is re-evaluated
-        // at runtime in get_memory_used() because at constructor time there
-        // may be no fds yet, or only fds that don't carry buffers.
-        if (module == "i915" || module == "xe")
-            try_fallback_memory_type();
-
-        SPDLOG_DEBUG(
-            "drm_engine_type = {}, drm_memory_type = {}",
-            drm_engine_type, drm_memory_type
-        );
-
-        if (called_from_amdgpu_cpp)
-            return;
-
-        // i915: Documentation/ABI/testing/sysfs-driver-intel-i915-hwmon
-        // xe  : Documentation/ABI/testing/sysfs-driver-intel-xe-hwmon
-
-        if (module == "i915") {
-            hwmon_sensors["voltage"]     = { .rx = std::regex("in(0)_input") };
-            hwmon_sensors["fan_speed"]   = { .rx = std::regex("fan(1)_input") };
-            hwmon_sensors["temp"]        = { .rx = std::regex("temp(1)_input") };
-            hwmon_sensors["energy"]      = { .rx = std::regex("energy(1)_input") };
-            hwmon_sensors["power_limit"] = { .rx = std::regex("power(1)_max") };
-        } else if (module == "xe") {
-            hwmon_sensors["voltage"]     = { .rx = std::regex("in(1)_input") };
-            // technically, there are 3 fan sensors, but just pick first one
-            hwmon_sensors["fan_speed"]   = { .rx = std::regex("fan(1)_input") };
-            hwmon_sensors["temp"]        = { .rx = std::regex("temp(2)_input") };
-            hwmon_sensors["vram_temp"]   = { .rx = std::regex("temp(3)_input") };
-            hwmon_sensors["energy"]    = { .rx = std::regex("energy(2)_input") };
-            hwmon_sensors["power_limit"] = { .rx = std::regex("power(2)_max") };
-        } else {
-            // For everyone else just guess
-            hwmon_sensors["voltage"]   = { .rx = std::regex("in(\\d+)_input") };
-            hwmon_sensors["fan_speed"] = { .rx = std::regex("fan(\\d+)_input") };
-            hwmon_sensors["temp"]      = { .rx = std::regex("temp(\\d+)_input") };
-            hwmon_sensors["power"]     = { .rx = std::regex("power(\\d+)_input") };
-            hwmon_sensors["energy"]    = { .rx = std::regex("energy(\\d+)_input") };
-        }
-
-        find_hwmon_sensors();
-
-        // Intel iGPUs have no GPU hwmon at all; try Intel RAPL "uncore" as
-        // a power source so we don't show 0 W forever.
-        if ((module == "i915" || module == "xe") &&
-            hwmon_sensors["power"].filename.empty() &&
-            hwmon_sensors["energy"].filename.empty())
-            find_intel_rapl_gpu();
-
-        if ((module == "i915" || module == "xe") &&
-            hwmon_sensors["temp"].filename.empty())
-            find_intel_pkg_temp();
-
-        if (module == "i915")
-            find_i915_gt_dir();
-        else if (module == "xe")
-            find_xe_gt_dir();
-
-        thread = std::thread(&GPU_fdinfo::main_thread, this);
-        // "mangohud-gpufdinfo" wouldn't fit in the 15 byte limit
-        pthread_setname_np(thread.native_handle(), "mangohud-gpufd");
-    }
+        const std::string driver, const std::string pci_dev, const std::string drm_node,
+        uint32_t device_id, uint32_t vendor_id
+    );
 
     ~GPU_fdinfo() {
         stop_thread = true;
@@ -277,6 +53,4 @@ public:
         paused = false;
         cond_var.notify_one();
     }
-
-    float amdgpu_helper_get_proc_vram();
 };

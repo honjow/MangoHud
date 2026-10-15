@@ -1,4 +1,4 @@
-systemd_dep = dependency('libsystemd')
+sdbus_dep = dependency('libsystemd', 'libelogind')
 
 ipc_inc = include_directories('.')
 
@@ -6,6 +6,7 @@ ipc_abi_inputs = files(
   'client.h',
   'ipc.h',
   'ipc_client.h',
+  'protocol.h',
   'client.cpp',
   'ipc.cpp',
   'ipc_client.cpp',
@@ -29,7 +30,7 @@ ipc_lib = static_library(
         'ipc_client.cpp',
         'client.cpp'),
   ipc_abi_hash,
-  dependencies: [systemd_dep,
+  dependencies: [sdbus_dep,
                  spdlog_dep,
                  dearimgui_dep,
                  implot_dep,
@@ -46,4 +47,5 @@ ipc_lib = static_library(
 ipc_dep = declare_dependency(
   link_with: ipc_lib,
   include_directories: [ipc_inc],
+  dependencies: [sdbus_dep],
 )

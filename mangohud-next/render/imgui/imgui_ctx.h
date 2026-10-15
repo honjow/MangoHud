@@ -35,13 +35,15 @@ class ImGuiCtx {
 public:
     std::shared_ptr<ImGuiEGL> egl;
     VkSemaphore sema = VK_NULL_HANDLE;
-    inline static std::mutex m;
+    inline static std::mutex global_m;
+    std::mutex m;
 
     ImGuiCtx();
     bool init();
-    bool draw(clientRes* r, slot_t* buf, Backend backend);
+    bool draw(uint32_t w, uint32_t h, Resolution& size, BufferSet* buf, Backend backend,
+              std::shared_ptr<HudConfig> hud, std::mutex& hud_m);
 
-    void init_vk(std::shared_ptr<VkCtx> vk_);
+    void init_vk(VkCtx* vk);
     void init_egl();
 
     void teardown();
@@ -57,14 +59,13 @@ private:
 
     inline static ColorCache colors;
 
-    void record_cmd(slot_t& buf, uint32_t w, uint32_t h);
+    void record_cmd(BufferSet& buf, uint32_t w, uint32_t h);
     static uint32_t calculate_width(const HudLayout& L, const HudWindow& window);
     static uint32_t calculate_height(const HudLayout& L, const HudWindow& window);
     static void right_aligned(const ImVec4& col, float off_x, const char *fmt, ...);
     static void RenderOutlinedText(ImVec4 textColor, const char* text);
     static void draw_value_with_unit(int col_index, const TextCell& tc, const ImVec4& unit_col, const HudLayout& L, Font* fonts, const hudTable& table, float row_h, float cell_w = 0.0f, bool numeric_align = false);
     static void draw_graph_plot(const TextCell& tc, float width);
-    static void draw_graph_header(const TextCell& tc, Font* fonts, const hudTable& table, const HudLayout& L);
     static void draw_progress_bar(const ProgressCell& pc, Font* fonts, const hudTable& table, float width, float height);
     static void draw_table(hudTable& table, Font* fonts, const HudLayout& layout, bool first_col_numeric = false);
     static void begin_window(const HudWindow& window, ImVec2 size, const char* name);

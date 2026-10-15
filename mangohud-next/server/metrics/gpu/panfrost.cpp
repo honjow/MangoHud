@@ -4,7 +4,8 @@
 Panfrost::Panfrost(
     const std::string& drm_node, const std::string& pci_dev,
     uint16_t vendor_id, uint16_t device_id
-) : GPU(drm_node, pci_dev, vendor_id, device_id, "gpu-panfrost"), FDInfo(drm_node) {
+) : GPU(drm_node, pci_dev, vendor_id, device_id, "gpu-panfrost"), FDInfo(drm_node),
+    device_memory("panfrost", pci_dev, {"drm-resident-memory"}, "/proc", drm_node) {
     hwmon.base_dir = hwmon.find_hwmon_dir_by_name("gpu_thermal");
     hwmon.setup(sensors, drm_node);
 }
@@ -19,6 +20,7 @@ int Panfrost::get_temperature() {
 }
 
 int Panfrost::get_core_clock() {
+    std::unique_lock lock(fdinfo.pids_mutex);
     if (fdinfo.pids.empty())
         return 0;
 
@@ -65,4 +67,8 @@ int Panfrost::get_process_load(pid_t pid) {
 
 float Panfrost::get_process_vram_used(pid_t pid) {
     return fdinfo.get_memory_used(pid, "drm-resident-memory");
+}
+
+float Panfrost::get_vram_used() {
+    return device_memory.get_memory_used();
 }
