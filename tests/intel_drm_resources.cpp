@@ -22,6 +22,9 @@ static void check(bool value, const char* message) {
 
 extern "C" void* __real_calloc(size_t count, size_t size);
 extern "C" void __real_free(void* pointer);
+extern "C" void* __wrap_calloc(size_t count, size_t size);
+extern "C" void __wrap_free(void* pointer);
+extern "C" int __wrap_ioctl(int fd, unsigned long request, ...);
 extern "C" void* __wrap_calloc(size_t count, size_t size) {
     auto* pointer = __real_calloc(count, size);
     last_allocation = pointer;
